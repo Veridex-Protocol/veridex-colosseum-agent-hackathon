@@ -13,7 +13,7 @@
     "heartbeat": "tsx agent/src/heartbeat.ts",
     "status": "tsx agent/src/status.ts",
     "proof": "tsx agent/src/proof-of-work.ts",
-    "forum": "tsx agent/src/forum-engine.ts",
+    "forum": "bun agent/src/forum-engine.ts",
     "dev:dashboard": "cd dashboard && bun run dev",
     "build": "tsc",
     "test": "vitest run",

@@ -25,6 +25,7 @@ if (!GEMINI_API_KEY) {
 }
 
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const GEMINI_MODEL = 'gemini-2.5-flash';
 
 const headers: Record<string, string> = {
   'Authorization': `Bearer ${API_KEY}`,
@@ -313,21 +314,24 @@ Vary the phrasing — make it feel like a fellow builder asking for support, not
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-pro',
+      model: GEMINI_MODEL,
       contents: prompt,
       config: {
         systemInstruction: SYSTEM_PROMPT,
         temperature: 0.85,
-        maxOutputTokens: 800,
+        maxOutputTokens: 2048,
       },
     });
 
     const text = response.text?.trim();
-    if (!text || text.length < 50) return null;
+    if (!text || text.length < 50) {
+      console.warn(`  ⚠️ Gemini returned short/empty (${text?.length || 0} chars)`);
+      return null;
+    }
     // Trim to 10000 chars (forum limit)
     return text.slice(0, 9900);
   } catch (err: any) {
-    console.warn(`  ⚠️ Gemini error: ${err.message?.slice(0, 100)}`);
+    console.warn(`  ⚠️ Gemini error: ${err.message?.slice(0, 200)}`);
     return null;
   }
 }
@@ -354,20 +358,23 @@ Vary the wording — keep it genuine and brief.`;
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-pro',
+      model: GEMINI_MODEL,
       contents: prompt,
       config: {
         systemInstruction: SYSTEM_PROMPT,
         temperature: 0.8,
-        maxOutputTokens: 600,
+        maxOutputTokens: 1500,
       },
     });
 
     const text = response.text?.trim();
-    if (!text || text.length < 30) return null;
+    if (!text || text.length < 30) {
+      console.warn(`  ⚠️ Gemini reply short/empty (${text?.length || 0} chars)`);
+      return null;
+    }
     return text.slice(0, 9900);
   } catch (err: any) {
-    console.warn(`  ⚠️ Gemini reply error: ${err.message?.slice(0, 100)}`);
+    console.warn(`  ⚠️ Gemini reply error: ${err.message?.slice(0, 200)}`);
     return null;
   }
 }
@@ -380,7 +387,7 @@ async function run() {
   console.log('🚀 Veridex Forum Engagement Engine v2 (Gemini-Powered)\n');
   console.log(`   Colosseum Key: ${API_KEY.slice(0, 10)}...`);
   console.log(`   Gemini Key:    ${GEMINI_API_KEY.slice(0, 10)}...`);
-  console.log(`   Model:         gemini-2.5-pro`);
+  console.log(`   Model:         ${GEMINI_MODEL}`);
   console.log(`   Time:          ${new Date().toISOString()}\n`);
 
   const skipPosts = process.argv.includes('--skip-posts');
