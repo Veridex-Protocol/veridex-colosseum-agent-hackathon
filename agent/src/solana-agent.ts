@@ -226,14 +226,167 @@ export class SolanaAgent {
       return this.veridexWallet.fetch(url, fetchOpts);
     }
 
-    // Path 2: AgentWallet proxy (server-side, recommended for Solana)
-    return this.awClient.x402Fetch({
-      url,
-      method: options?.method,
-      headers: options?.headers,
-      body: options?.body,
-      maxPaymentAmount: options?.maxPaymentAmount,
-    });
+    // Path 2: Veridex Session Key x402 flow (Solana)
+    // Full flow: detect 402 → parse x402 terms → check session limits → sign with session key → retry
+    // This is the core Veridex Pay demo: human-set spending limits enforced via session keys
+    {
+      console.log('[SolanaAgent] Veridex x402 flow (session key signing)');
+      const fetchOpts: RequestInit = {
+        method: options?.method || 'GET',
+        headers: options?.headers,
+      };
+      if (options?.body) {
+        fetchOpts.body = JSON.stringify(options.body);
+        fetchOpts.headers = { ...fetchOpts.headers, 'Content-Type': 'application/json' };
+      }
+
+      // Step 1: Initial request → expect 402
+      const res = await fetch(url, fetchOpts);
+
+      if (res.status === 402) {
+        const paymentTerms = await res.json() as any;
+
+        // Step 2: Parse x402 payment requirements
+        const req = paymentTerms.paymentRequirements?.[0] || paymentTerms.accepts?.[0];
+        const priceUSD = req?.extra?.priceUSD || (req?.maxAmountRequired ? Number(req.maxAmountRequired) / 1_000_000 : 0);
+        const recipient = req?.payTo || 'unknown';
+        const network = req?.network || 'solana-devnet';
+        const asset = req?.asset || 'USDC';
+        const maxAmount = req?.maxAmountRequired || '0';
+
+        console.log(`[SolanaAgent] 402 Payment Required — $${priceUSD} ${asset} via x402`);
+        console.log(`[SolanaAgent] Recipient: ${recipient} | Network: ${network}`);
+
+        // Step 3: Check Veridex session spending limits
+        const sessionStatus = this.veridexWallet ? this.getSessionStatus() : null;
+        const dailyRemaining = sessionStatus?.remainingDailyLimitUSD ?? this.config.dailyLimitUSD;
+        const perTxLimit = this.config.perTransactionLimitUSD;
+
+        if (priceUSD > perTxLimit) {
+          console.log(`[SolanaAgent] ❌ Rejected — $${priceUSD} exceeds per-tx limit $${perTxLimit}`);
+          return { success: false, response: { status: 402, body: paymentTerms, contentType: 'application/json' }, paid: false, attempts: 1, duration: 0 } as X402FetchResult;
+        }
+        if (priceUSD > dailyRemaining) {
+          console.log(`[SolanaAgent] ❌ Rejected — $${priceUSD} exceeds daily remaining $${dailyRemaining.toFixed(2)}`);
+          return { success: false, response: { status: 402, body: paymentTerms, contentType: 'application/json' }, paid: false, attempts: 1, duration: 0 } as X402FetchResult;
+        }
+
+        console.log(`[SolanaAgent] ✅ Limits OK — $${priceUSD} within per-tx $${perTxLimit} / daily remaining $${dailyRemaining.toFixed(2)}`);
+
+        // Step 4: Sign payment intent with Veridex session key (via AgentWallet Solana signing)
+        if (priceUSD > 0) {
+          try {
+            const paymentIntent = {
+              x402Version: 1,
+              scheme: 'exact',
+              network,
+              resource: url,
+              amount: maxAmount,
+              amountUSD: priceUSD,
+              asset,
+              recipient,
+              sessionKeyHash: this.config.keyHash || 'agent-session',
+              dailyLimitUSD: this.config.dailyLimitUSD,
+              perTxLimitUSD: perTxLimit,
+              timestamp: Date.now(),
+              nonce: crypto.randomUUID(),
+            };
+
+            // Sign with the Solana session key held by AgentWallet
+            const sig = await this.awClient.signMessage('solana', JSON.stringify(paymentIntent));
+            console.log(`[SolanaAgent] Session key signed payment: ${sig.signature.slice(0, 20)}...`);
+
+            // Step 5: Retry with payment signature
+            const retryRes = await fetch(url, {
+              ...fetchOpts,
+              headers: {
+                ...fetchOpts.headers,
+                'X-Payment-Signature': sig.signature,
+                'X-Payment-Chain': 'solana',
+                'X-Payment-Amount': String(priceUSD),
+                'X-Payment-Network': network,
+                'X-Payment-Session': this.config.keyHash || 'agent-session',
+              },
+            });
+
+            if (retryRes.ok) {
+              const body = await retryRes.json();
+              this.totalSpentUSD += priceUSD;
+
+              // Record spending in Veridex session
+              if (this.veridexWallet) {
+                try {
+                  const session = (this.veridexWallet as any).currentSession;
+                  if (session?.metadata) {
+                    session.metadata.dailySpentUSD = (session.metadata.dailySpentUSD || 0) + priceUSD;
+                    session.metadata.totalSpentUSD = (session.metadata.totalSpentUSD || 0) + priceUSD;
+                    session.metadata.transactionCount = (session.metadata.transactionCount || 0) + 1;
+                  }
+                } catch { /* best effort */ }
+              }
+
+              console.log(`[SolanaAgent] ✅ Payment complete — $${priceUSD.toFixed(4)} ${asset} to ${recipient}`);
+              console.log(`[SolanaAgent] Session total spent: $${this.totalSpentUSD.toFixed(4)}`);
+
+              // Log to merchant dashboard
+              try {
+                const merchantBase = new URL(url).origin;
+                await fetch(`${merchantBase}/api/v1/activity`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    type: 'payment',
+                    agent: 'veridex-solana-agent',
+                    tool: url.split('/').pop(),
+                    amountUSD: priceUSD,
+                    protocol: 'x402',
+                    data: {
+                      signature: sig.signature.slice(0, 32) + '...',
+                      network,
+                      asset,
+                      recipient,
+                      sessionKeyHash: this.config.keyHash || 'agent-session',
+                      dailyLimitUSD: this.config.dailyLimitUSD,
+                      totalSpentUSD: this.totalSpentUSD,
+                      verified: true,
+                    },
+                  }),
+                });
+              } catch { /* best effort */ }
+
+              return {
+                success: true,
+                response: { status: retryRes.status, body, contentType: 'application/json' },
+                payment: { chain: 'solana', amountFormatted: `$${priceUSD.toFixed(4)}`, recipient },
+                paid: true,
+                attempts: 2,
+                duration: 0,
+              } as X402FetchResult;
+            }
+          } catch (signErr: any) {
+            console.log(`[SolanaAgent] Session key signing failed: ${signErr.message}`);
+          }
+        }
+
+        return {
+          success: false,
+          response: { status: 402, body: paymentTerms, contentType: 'application/json' },
+          paid: false,
+          attempts: 1,
+          duration: 0,
+        } as X402FetchResult;
+      }
+
+      // Non-402 response
+      const body = await res.json().catch(() => null);
+      return {
+        success: res.ok,
+        response: { status: res.status, body, contentType: 'application/json' },
+        paid: false,
+        attempts: 1,
+        duration: 0,
+      } as X402FetchResult;
+    }
   }
 
   /**

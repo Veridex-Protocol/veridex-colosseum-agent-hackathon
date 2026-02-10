@@ -25,6 +25,8 @@ import cors from 'cors';
 import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import crypto from 'crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join, dirname } from 'path';
 
 const app = express();
 app.use(cors({ origin: true, credentials: true }));
@@ -162,26 +164,28 @@ function x402Paywall(priceUSD: number, toolId: string) {
     }
 
     // No payment — return 402 with payment requirements
+    // Veridex SDK PaymentParser expects: { paymentRequirements: [{ scheme, network, maxAmountRequired, asset, payTo }] }
+    // encoded as base64 in the PAYMENT-REQUIRED header
     const paymentRequirements = {
-      x402Version: 1,
-      accepts: [
+      paymentRequirements: [
         {
           scheme: 'exact',
-          network: 'solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1',
+          network: 'solana-devnet',
           maxAmountRequired: String(Math.round(priceUSD * 1_000_000)),
-          resource: `${req.protocol}://${req.get('host')}${req.originalUrl}`,
-          description: tools.find((t) => t.id === toolId)?.name || toolId,
-          mimeType: 'application/json',
-          payTo: RECIPIENT,
-          maxTimeoutSeconds: 60,
           asset: 'USDC',
+          payTo: RECIPIENT,
+          description: tools.find((t) => t.id === toolId)?.name || toolId,
           extra: {
             name: tools.find((t) => t.id === toolId)?.name,
             priceUSD,
+            resource: `${req.protocol}://${req.get('host')}${req.originalUrl}`,
           },
         },
       ],
     };
+
+    // Base64 encode for the PAYMENT-REQUIRED header (Veridex SDK format)
+    const encoded = Buffer.from(JSON.stringify(paymentRequirements)).toString('base64');
 
     logActivity({
       type: 'tool_call',
@@ -194,6 +198,7 @@ function x402Paywall(priceUSD: number, toolId: string) {
 
     res.status(402)
       .set('X-Payment-Required', 'true')
+      .set('PAYMENT-REQUIRED', encoded)
       .set('Content-Type', 'application/json')
       .json(paymentRequirements);
   };
@@ -211,6 +216,13 @@ app.get('/api/v1/tools', (_req, res) => {
 app.get('/api/v1/activity', (_req, res) => {
   const limit = Math.min(parseInt(String(_req.query.limit) || '50', 10), 200);
   res.json({ activity: activityLog.slice(0, limit), total: activityLog.length });
+});
+
+app.post('/api/v1/activity', (req, res) => {
+  const { type, agent, tool, amountUSD, protocol, txHash, solanaProof, data } = req.body;
+  if (!type) return res.status(400).json({ error: 'type is required' });
+  const entry = logActivity({ type, agent, tool, amountUSD, protocol, txHash, solanaProof, data });
+  res.json({ success: true, id: entry.id });
 });
 
 app.get('/api/v1/stats', (_req, res) => {
@@ -242,10 +254,11 @@ app.get('/health', (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Agent Credential Storage (Passkey + Session Key)
+// Agent Credential Storage (Passkey + Session Key) — File-Persisted
 // ---------------------------------------------------------------------------
 
 interface AgentCredentials {
+  id: string; // credentialId as unique key
   wallet: {
     credentialId: string;
     publicKeyX: string;
@@ -265,7 +278,50 @@ interface AgentCredentials {
   revokedAt?: number;
 }
 
-let agentCredentials: AgentCredentials | null = null;
+interface CredentialStore {
+  credentials: AgentCredentials[];
+  activeId: string | null; // Currently active credential ID
+}
+
+const CRED_FILE = join(process.cwd(), 'data/credentials.json');
+
+function loadCredentials(): CredentialStore {
+  try {
+    if (existsSync(CRED_FILE)) {
+      const data = JSON.parse(readFileSync(CRED_FILE, 'utf-8'));
+      return data as CredentialStore;
+    }
+  } catch (err: any) {
+    console.warn(`⚠️ Failed to load credentials: ${err.message}`);
+  }
+  return { credentials: [], activeId: null };
+}
+
+function saveCredentials(store: CredentialStore): void {
+  try {
+    const dir = dirname(CRED_FILE);
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    writeFileSync(CRED_FILE, JSON.stringify(store, null, 2));
+  } catch (err: any) {
+    console.warn(`⚠️ Failed to save credentials: ${err.message}`);
+  }
+}
+
+let credStore = loadCredentials();
+if (credStore.credentials.length > 0) {
+  console.log(`🔑 Loaded ${credStore.credentials.length} stored credential(s)`);
+  const active = credStore.credentials.find(c => c.id === credStore.activeId && !c.revokedAt);
+  if (active) {
+    console.log(`   Active: ${active.wallet.credentialId.slice(0, 20)}... (limit: $${active.session.dailyLimitUSD}/day)`);
+  }
+}
+
+function getActiveCredentials(): AgentCredentials | null {
+  if (!credStore.activeId) return null;
+  const cred = credStore.credentials.find(c => c.id === credStore.activeId);
+  if (!cred || cred.revokedAt) return null;
+  return cred;
+}
 
 // POST /api/v1/agent/credentials — Human sends passkey + session key
 app.post('/api/v1/agent/credentials', (req, res) => {
@@ -274,11 +330,26 @@ app.post('/api/v1/agent/credentials', (req, res) => {
     return res.status(400).json({ error: 'Missing wallet or session data' });
   }
 
-  agentCredentials = {
+  const id = wallet.credentialId;
+
+  // Check if credential already exists — update it
+  const existing = credStore.credentials.findIndex(c => c.id === id);
+  const cred: AgentCredentials = {
+    id,
     wallet,
     session,
     createdAt: Date.now(),
   };
+
+  if (existing >= 0) {
+    credStore.credentials[existing] = cred;
+  } else {
+    credStore.credentials.push(cred);
+  }
+
+  // Set as active
+  credStore.activeId = id;
+  saveCredentials(credStore);
 
   logActivity({
     type: 'discovery',
@@ -296,43 +367,95 @@ app.post('/api/v1/agent/credentials', (req, res) => {
   console.log(`   Session key: ${session.keyHash.slice(0, 20)}...`);
   console.log(`   Daily limit: $${session.dailyLimitUSD}`);
   console.log(`   Per-tx limit: $${session.perTransactionLimitUSD}`);
+  console.log(`   Total stored: ${credStore.credentials.length}`);
 
-  res.json({ success: true, keyHash: wallet.keyHash });
+  res.json({ success: true, keyHash: wallet.keyHash, totalCredentials: credStore.credentials.length });
 });
 
-// GET /api/v1/agent/credentials — Agent fetches its session key
+// GET /api/v1/agent/credentials — Agent fetches active session key
 app.get('/api/v1/agent/credentials', (_req, res) => {
-  if (!agentCredentials || agentCredentials.revokedAt) {
+  const active = getActiveCredentials();
+  if (!active) {
     return res.status(404).json({ error: 'No active credentials' });
   }
-  res.json(agentCredentials);
+  res.json(active);
 });
 
-// DELETE /api/v1/agent/credentials — Human revokes session key
+// GET /api/v1/agent/credentials/all — List all stored credentials
+app.get('/api/v1/agent/credentials/all', (_req, res) => {
+  res.json({
+    credentials: credStore.credentials.map(c => ({
+      id: c.id,
+      keyHash: c.wallet.keyHash,
+      dailyLimitUSD: c.session.dailyLimitUSD,
+      perTransactionLimitUSD: c.session.perTransactionLimitUSD,
+      createdAt: c.createdAt,
+      revokedAt: c.revokedAt,
+      isActive: c.id === credStore.activeId,
+    })),
+    activeId: credStore.activeId,
+    total: credStore.credentials.length,
+  });
+});
+
+// PUT /api/v1/agent/credentials/:id/activate — Switch active credential
+app.put('/api/v1/agent/credentials/:id/activate', (req, res) => {
+  const cred = credStore.credentials.find(c => c.id === req.params.id);
+  if (!cred) return res.status(404).json({ error: 'Credential not found' });
+  if (cred.revokedAt) return res.status(400).json({ error: 'Credential is revoked' });
+  credStore.activeId = cred.id;
+  saveCredentials(credStore);
+  res.json({ success: true, activeId: credStore.activeId });
+});
+
+// DELETE /api/v1/agent/credentials — Revoke active credential
 app.delete('/api/v1/agent/credentials', (_req, res) => {
-  if (!agentCredentials) {
-    return res.status(404).json({ error: 'No credentials to revoke' });
+  const active = getActiveCredentials();
+  if (!active) {
+    return res.status(404).json({ error: 'No active credentials to revoke' });
   }
-  agentCredentials.revokedAt = Date.now();
+  active.revokedAt = Date.now();
+
+  // Find next non-revoked credential to make active
+  const next = credStore.credentials.find(c => !c.revokedAt && c.id !== active.id);
+  credStore.activeId = next?.id || null;
+  saveCredentials(credStore);
 
   logActivity({
     type: 'discovery',
     agent: 'human',
-    data: { action: 'credentials_revoked' },
+    data: { action: 'credentials_revoked', keyHash: active.wallet.keyHash },
   });
 
-  console.log('\n🚫 Agent credentials revoked by human');
-  res.json({ success: true, revokedAt: agentCredentials.revokedAt });
+  console.log(`\n🚫 Credential revoked: ${active.wallet.credentialId.slice(0, 20)}...`);
+  res.json({ success: true, revokedAt: active.revokedAt, newActiveId: credStore.activeId });
+});
+
+// DELETE /api/v1/agent/credentials/:id — Revoke specific credential
+app.delete('/api/v1/agent/credentials/:id', (req, res) => {
+  const cred = credStore.credentials.find(c => c.id === req.params.id);
+  if (!cred) return res.status(404).json({ error: 'Credential not found' });
+  cred.revokedAt = Date.now();
+  if (credStore.activeId === cred.id) {
+    const next = credStore.credentials.find(c => !c.revokedAt && c.id !== cred.id);
+    credStore.activeId = next?.id || null;
+  }
+  saveCredentials(credStore);
+  res.json({ success: true, revokedAt: cred.revokedAt });
 });
 
 // GET /api/v1/agent/status — Check agent credential status
 app.get('/api/v1/agent/status', (_req, res) => {
+  const active = getActiveCredentials();
   res.json({
-    hasCredentials: !!agentCredentials && !agentCredentials.revokedAt,
-    createdAt: agentCredentials?.createdAt,
-    revokedAt: agentCredentials?.revokedAt,
-    dailyLimitUSD: agentCredentials?.session?.dailyLimitUSD,
-    perTransactionLimitUSD: agentCredentials?.session?.perTransactionLimitUSD,
+    hasCredentials: !!active,
+    activeId: credStore.activeId,
+    totalCredentials: credStore.credentials.length,
+    activeCredentials: credStore.credentials.filter(c => !c.revokedAt).length,
+    createdAt: active?.createdAt,
+    revokedAt: active?.revokedAt,
+    dailyLimitUSD: active?.session?.dailyLimitUSD,
+    perTransactionLimitUSD: active?.session?.perTransactionLimitUSD,
   });
 });
 

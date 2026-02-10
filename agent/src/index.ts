@@ -62,16 +62,24 @@ function logStep(step: WorkflowStep) {
 async function checkStatus(client: ColosseumClient): Promise<void> {
   const start = Date.now();
   try {
-    const status = await client.getStatus();
-    state.agentId = status.agent.id;
-    state.agentName = status.agent.name;
+    const status = await client.getStatus() as any;
 
     if (status.hackathon) {
       console.log(`\n📅 Day ${status.hackathon.currentDay} — ${status.hackathon.daysRemaining} days left (${status.hackathon.timeRemainingFormatted})`);
     }
 
+    if (status.engagement) {
+      console.log(`📊 Forum: ${status.engagement.forumPostCount} posts, ${status.engagement.repliesOnYourPosts} replies | Project: ${status.engagement.projectStatus}`);
+    }
+
     if (status.announcement) {
-      console.log(`📢 ${status.announcement}`);
+      const msg = typeof status.announcement === 'string' ? status.announcement : status.announcement.message || JSON.stringify(status.announcement);
+      console.log(`📢 ${msg}`);
+    }
+
+    if (status.nextSteps?.length) {
+      console.log('📋 Next steps:');
+      status.nextSteps.forEach((s: string) => console.log(`   → ${s}`));
     }
 
     // Handle active poll
@@ -79,8 +87,6 @@ async function checkStatus(client: ColosseumClient): Promise<void> {
       try {
         const poll = await client.getActivePoll();
         console.log(`📊 Active poll: ${JSON.stringify(poll)}`);
-        // Auto-respond to polls if they have simple options
-        // (In a real agent, this would use LLM reasoning)
       } catch (err: any) {
         console.warn(`   Poll fetch failed: ${err.message}`);
       }
@@ -91,7 +97,7 @@ async function checkStatus(client: ColosseumClient): Promise<void> {
       timestamp: start,
       type: 'heartbeat',
       action: 'Checked agent status',
-      output: { agentId: status.agent.id, day: status.hackathon?.currentDay },
+      output: { status: status.status, day: status.hackathon?.currentDay },
       durationMs: Date.now() - start,
       status: 'success',
     });
@@ -299,7 +305,10 @@ async function discoverAndPayTools(solanaAgent: SolanaAgent): Promise<void> {
     }
 
     // Step 2: Call the SOL price tool via x402
-    console.log('\n💳 Calling SOL price feed via x402...');
+    // For local HTTP merchant, use direct fetch path (AgentWallet proxy rejects HTTP,
+    // and Veridex SDK's x402 handler uses ERC-3009 EVM signing which doesn't work for Solana devnet).
+    // The direct path demonstrates the full x402 protocol: detect 402 → parse → sign → retry.
+    console.log(`\n💳 Calling SOL price feed via x402...`);
     const priceResult = await solanaAgent.x402Fetch(`${MERCHANT_URL}/api/v1/market/sol`, {
       method: 'GET',
       headers: { 'X-Agent-Name': 'veridex-solana-agent' },
@@ -333,7 +342,7 @@ async function discoverAndPayTools(solanaAgent: SolanaAgent): Promise<void> {
     }
 
     // Step 3: Call market analysis tool
-    console.log('\n💳 Calling market analysis via x402...');
+    console.log(`\n💳 Calling market analysis via x402...`);
     const analysisResult = await solanaAgent.x402Fetch(`${MERCHANT_URL}/api/v1/analyze`, {
       method: 'POST',
       headers: { 'X-Agent-Name': 'veridex-solana-agent' },
@@ -419,18 +428,56 @@ async function main() {
 
   // Initialize clients
   const client = new ColosseumClient(COLOSSEUM_API_KEY);
+
+  // Fetch Veridex credentials from merchant dashboard API
+  let credentialId: string | undefined;
+  let publicKeyX: string | undefined;
+  let publicKeyY: string | undefined;
+  let keyHash: string | undefined;
+  let dailyLimit = parseFloat(process.env.AGENT_DAILY_LIMIT || '50');
+  let perTxLimit = parseFloat(process.env.AGENT_PER_TX_LIMIT || '5');
+
+  try {
+    console.log(`\n🔑 Fetching Veridex credentials from ${MERCHANT_URL}/api/v1/agent/credentials...`);
+    const credRes = await fetch(`${MERCHANT_URL}/api/v1/agent/credentials`);
+    if (credRes.ok) {
+      const creds = await credRes.json() as any;
+      credentialId = creds.wallet?.credentialId;
+      publicKeyX = creds.wallet?.publicKeyX;
+      publicKeyY = creds.wallet?.publicKeyY;
+      keyHash = creds.wallet?.keyHash;
+      dailyLimit = creds.session?.dailyLimitUSD || dailyLimit;
+      perTxLimit = creds.session?.perTransactionLimitUSD || perTxLimit;
+      console.log(`   ✅ Credentials loaded — passkey: ${credentialId?.slice(0, 20)}...`);
+      console.log(`   Daily limit: $${dailyLimit} | Per-tx: $${perTxLimit}`);
+    } else {
+      console.log('   ⚠️ No credentials on merchant — set them up via the dashboard at /setup');
+      console.log('   Falling back to env vars...');
+      credentialId = process.env.VERIDEX_CREDENTIAL_ID || undefined;
+      publicKeyX = process.env.VERIDEX_PUBLIC_KEY_X || undefined;
+      publicKeyY = process.env.VERIDEX_PUBLIC_KEY_Y || undefined;
+      keyHash = process.env.VERIDEX_KEY_HASH || undefined;
+    }
+  } catch (err: any) {
+    console.log(`   ⚠️ Merchant not reachable (${err.message}) — using env vars`);
+    credentialId = process.env.VERIDEX_CREDENTIAL_ID || undefined;
+    publicKeyX = process.env.VERIDEX_PUBLIC_KEY_X || undefined;
+    publicKeyY = process.env.VERIDEX_PUBLIC_KEY_Y || undefined;
+    keyHash = process.env.VERIDEX_KEY_HASH || undefined;
+  }
+
   const solanaAgent = new SolanaAgent({
     // AgentWallet (required for Solana ops)
     agentWalletUsername: process.env.AGENT_WALLET_USERNAME || '',
     agentWalletToken: process.env.AGENT_WALLET_API_KEY || '',
-    // Veridex SDK (optional — for multi-protocol detection)
-    credentialId: process.env.VERIDEX_CREDENTIAL_ID || undefined,
-    publicKeyX: process.env.VERIDEX_PUBLIC_KEY_X || undefined,
-    publicKeyY: process.env.VERIDEX_PUBLIC_KEY_Y || undefined,
-    keyHash: process.env.VERIDEX_KEY_HASH || undefined,
+    // Veridex SDK (from dashboard or env vars)
+    credentialId,
+    publicKeyX,
+    publicKeyY,
+    keyHash,
     // Spending limits
-    dailyLimitUSD: parseFloat(process.env.AGENT_DAILY_LIMIT || '50'),
-    perTransactionLimitUSD: parseFloat(process.env.AGENT_PER_TX_LIMIT || '5'),
+    dailyLimitUSD: dailyLimit,
+    perTransactionLimitUSD: perTxLimit,
     relayerUrl: process.env.VERIDEX_RELAYER_URL,
     relayerApiKey: process.env.VERIDEX_RELAYER_KEY,
   });

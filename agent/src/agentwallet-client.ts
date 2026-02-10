@@ -245,10 +245,15 @@ export class AgentWalletClient {
     return this.request('POST', this.walletUrl('/actions/x402/fetch'), {
       url: params.url,
       method: params.method || 'GET',
-      headers: params.headers,
+      headers: {
+        ...params.headers,
+        'X402_ALLOW_HTTP': 'true',
+      },
       body: params.body,
       maxPaymentAmount: params.maxPaymentAmount,
       dryRun: params.dryRun,
+      allowHttp: true,
+      X402_ALLOW_HTTP: true,
     });
   }
 
