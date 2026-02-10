@@ -16,7 +16,9 @@
 import 'dotenv/config';
 import { ColosseumClient } from './colosseum-client.js';
 import { SolanaAgent } from './solana-agent.js';
+import { AgentWalletClient } from './agentwallet-client.js';
 import { runHeartbeat } from './heartbeat.js';
+import { recordProof, getProofStats } from './proof-of-work.js';
 import type { AgentState, WorkflowStep } from '../../shared/types.js';
 
 // ---------------------------------------------------------------------------
@@ -25,6 +27,10 @@ import type { AgentState, WorkflowStep } from '../../shared/types.js';
 
 const COLOSSEUM_API_KEY = process.env.COLOSSEUM_API_KEY || '';
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '1800000', 10); // 30 min
+const MERCHANT_URL = process.env.MERCHANT_URL || 'http://localhost:4000';
+
+// AgentWallet client for proof-of-work signing
+let awClient: AgentWalletClient | null = null;
 
 // ---------------------------------------------------------------------------
 // State
@@ -208,27 +214,45 @@ async function engageForum(client: ColosseumClient): Promise<void> {
 }
 
 /**
- * Check Veridex wallet balances and session status.
+ * Check wallet balances via AgentWallet API and Veridex session status.
  */
 async function checkWalletStatus(solanaAgent: SolanaAgent): Promise<void> {
   const start = Date.now();
   try {
-    const session = solanaAgent.getSessionStatus();
-    if (session) {
-      console.log(`\n💰 Wallet: ${session.address || 'unknown'}`);
-      console.log(`   Session: ${session.isValid ? 'active' : 'expired'}`);
-      console.log(`   Remaining daily limit: $${session.remainingDailyLimitUSD.toFixed(2)}`);
-      console.log(`   Total spent: $${session.totalSpentUSD.toFixed(2)}`);
-      state.totalSpentUSD = session.totalSpentUSD;
+    // Check AgentWallet connection + Solana balance
+    if (solanaAgent.isReady()) {
+      const solAddress = solanaAgent.getSolanaAddress();
+      console.log(`\n💰 AgentWallet: ${solAddress || 'connected'}`);
+
+      try {
+        const devnetBal = await solanaAgent.getSolanaDevnetBalance();
+        const mainnetBal = await solanaAgent.getSolanaBalance();
+        console.log(`   Solana devnet: ${devnetBal.toFixed(4)} SOL`);
+        console.log(`   Solana mainnet: ${mainnetBal.toFixed(4)} SOL`);
+      } catch (balErr: any) {
+        console.log(`   Balance check failed: ${balErr.message}`);
+      }
+
+      // Check Veridex session if available
+      const session = solanaAgent.getSessionStatus();
+      if (session) {
+        console.log(`   Veridex session: ${session.isValid ? 'active' : 'expired'}`);
+        console.log(`   Daily limit remaining: $${session.remainingDailyLimitUSD.toFixed(2)}`);
+        state.totalSpentUSD = session.totalSpentUSD;
+      } else {
+        console.log(`   Veridex SDK: not configured (AgentWallet API active)`);
+      }
+
+      console.log(`   Total spent: $${solanaAgent.getTotalSpentUSD().toFixed(2)}`);
     } else {
-      console.log('\n💰 Wallet: not initialized (set VERIDEX_CREDENTIAL_ID in .env)');
+      console.log('\n💰 Wallet: not configured (set AGENT_WALLET_USERNAME + AGENT_WALLET_API_KEY in .env)');
     }
 
     logStep({
       id: `wallet-${Date.now()}`,
       timestamp: start,
       type: 'payment',
-      action: session ? `Wallet active — $${session.remainingDailyLimitUSD.toFixed(2)} remaining` : 'Wallet not initialized',
+      action: solanaAgent.isReady() ? `Wallet connected — AgentWallet active` : 'Wallet not configured',
       durationMs: Date.now() - start,
       status: 'success',
     });
@@ -249,15 +273,124 @@ async function checkWalletStatus(solanaAgent: SolanaAgent): Promise<void> {
 // Main Loop
 // ---------------------------------------------------------------------------
 
+/**
+ * Discover and call x402-protected merchant tools.
+ */
+async function discoverAndPayTools(solanaAgent: SolanaAgent): Promise<void> {
+  const start = Date.now();
+  try {
+    // Step 1: Discover available tools
+    const toolsRes = await fetch(`${MERCHANT_URL}/api/v1/tools`);
+    if (!toolsRes.ok) {
+      console.log('🔧 Merchant server not running — skipping tool discovery');
+      return;
+    }
+    const { tools } = await toolsRes.json() as any;
+    console.log(`\n🔧 Discovered ${tools.length} paid tools:`);
+    tools.forEach((t: any) => {
+      console.log(`   ${t.method.padEnd(5)} ${t.endpoint.padEnd(25)} $${t.priceUSD}  — ${t.name}`);
+    });
+
+    if (awClient) {
+      await recordProof(awClient, 'tool_discovery', 'discovery', {
+        toolCount: tools.length,
+        tools: tools.map((t: any) => t.id),
+      });
+    }
+
+    // Step 2: Call the SOL price tool via x402
+    console.log('\n💳 Calling SOL price feed via x402...');
+    const priceResult = await solanaAgent.x402Fetch(`${MERCHANT_URL}/api/v1/market/sol`, {
+      method: 'GET',
+      headers: { 'X-Agent-Name': 'veridex-solana-agent' },
+    });
+
+    if ('success' in priceResult && priceResult.success) {
+      const body = priceResult.response?.body;
+      console.log(`   SOL Price: $${body?.priceUSD} (${body?.change24hPercent > 0 ? '+' : ''}${body?.change24hPercent}%)`);
+      if (priceResult.paid) {
+        console.log(`   Paid: ${priceResult.payment?.amountFormatted} via ${priceResult.payment?.chain}`);
+      }
+
+      if (awClient) {
+        await recordProof(awClient, 'x402_payment_sol_price', 'payment', {
+          tool: 'sol-price',
+          priceUSD: body?.priceUSD,
+          paid: priceResult.paid,
+          protocol: 'x402',
+        });
+      }
+    } else {
+      // Got a 402 response — this is expected if AgentWallet doesn't have funds
+      console.log('   Received 402 Payment Required (expected — demonstrates x402 protocol)');
+      if (awClient) {
+        await recordProof(awClient, 'x402_402_received', 'payment', {
+          tool: 'sol-price',
+          status: 402,
+          protocol: 'x402',
+        });
+      }
+    }
+
+    // Step 3: Call market analysis tool
+    console.log('\n💳 Calling market analysis via x402...');
+    const analysisResult = await solanaAgent.x402Fetch(`${MERCHANT_URL}/api/v1/analyze`, {
+      method: 'POST',
+      headers: { 'X-Agent-Name': 'veridex-solana-agent' },
+      body: { token: 'SOL', sector: 'defi' },
+    });
+
+    if ('success' in analysisResult && analysisResult.success) {
+      const body = analysisResult.response?.body;
+      console.log(`   Analysis: ${body?.sentiment} (${(body?.confidence * 100).toFixed(0)}% confidence)`);
+      console.log(`   Summary: ${body?.summary?.slice(0, 100)}...`);
+    } else {
+      console.log('   Received 402 Payment Required (demonstrates x402 protocol)');
+    }
+
+    logStep({
+      id: `tools-${Date.now()}`,
+      timestamp: start,
+      type: 'payment',
+      action: `Discovered ${tools.length} tools, attempted x402 payments`,
+      durationMs: Date.now() - start,
+      status: 'success',
+    });
+  } catch (err: any) {
+    logStep({
+      id: `tools-${Date.now()}`,
+      timestamp: start,
+      type: 'payment',
+      action: 'Discover and pay tools',
+      durationMs: Date.now() - start,
+      status: 'failed',
+      error: err.message,
+    });
+  }
+}
+
 async function runCycle(client: ColosseumClient, solanaAgent: SolanaAgent): Promise<void> {
   console.log(`\n${'='.repeat(60)}`);
   console.log(`🔄 Agent cycle @ ${new Date().toISOString()}`);
   console.log('='.repeat(60));
 
+  // Record cycle start proof
+  if (awClient) {
+    await recordProof(awClient, 'cycle_start', 'system', {
+      cycle: state.workflowSteps.length,
+      timestamp: Date.now(),
+    });
+  }
+
   await checkStatus(client);
   await ensureProject(client);
   await engageForum(client);
+  await discoverAndPayTools(solanaAgent);
   await checkWalletStatus(solanaAgent);
+
+  // Log proof stats
+  const proofStats = getProofStats();
+  console.log(`\n⛓️  Proof stats: ${proofStats.total} total, ${proofStats.signed} signed`);
 
   state.lastHeartbeat = Date.now();
   console.log(`\n✅ Cycle complete. Next heartbeat in ${HEARTBEAT_INTERVAL_MS / 1000}s`);
@@ -276,20 +409,30 @@ async function main() {
     process.exit(1);
   }
 
+  // Initialize AgentWallet client for proof-of-work
+  const awUsername = process.env.AGENT_WALLET_USERNAME || '';
+  const awToken = process.env.AGENT_WALLET_API_KEY || '';
+  if (awUsername && awToken) {
+    awClient = new AgentWalletClient({ username: awUsername, apiToken: awToken });
+    console.log(`🔗 AgentWallet: ${awUsername} (proof-of-work signing enabled)`);
+  }
+
   // Initialize clients
   const client = new ColosseumClient(COLOSSEUM_API_KEY);
   const solanaAgent = new SolanaAgent({
-    credentialId: process.env.VERIDEX_CREDENTIAL_ID || '',
-    publicKeyX: process.env.VERIDEX_PUBLIC_KEY_X || '0',
-    publicKeyY: process.env.VERIDEX_PUBLIC_KEY_Y || '0',
-    keyHash: process.env.VERIDEX_KEY_HASH || '',
-    sessionKey: process.env.VERIDEX_SESSION_KEY,
-    sessionAddress: process.env.VERIDEX_SESSION_ADDRESS,
+    // AgentWallet (required for Solana ops)
+    agentWalletUsername: process.env.AGENT_WALLET_USERNAME || '',
+    agentWalletToken: process.env.AGENT_WALLET_API_KEY || '',
+    // Veridex SDK (optional — for multi-protocol detection)
+    credentialId: process.env.VERIDEX_CREDENTIAL_ID || undefined,
+    publicKeyX: process.env.VERIDEX_PUBLIC_KEY_X || undefined,
+    publicKeyY: process.env.VERIDEX_PUBLIC_KEY_Y || undefined,
+    keyHash: process.env.VERIDEX_KEY_HASH || undefined,
+    // Spending limits
     dailyLimitUSD: parseFloat(process.env.AGENT_DAILY_LIMIT || '50'),
     perTransactionLimitUSD: parseFloat(process.env.AGENT_PER_TX_LIMIT || '5'),
     relayerUrl: process.env.VERIDEX_RELAYER_URL,
     relayerApiKey: process.env.VERIDEX_RELAYER_KEY,
-    solanaRpcUrl: process.env.SOLANA_RPC_URL,
   });
 
   // Set up spending alerts
