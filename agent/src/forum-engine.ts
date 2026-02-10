@@ -31,16 +31,51 @@ const headers: Record<string, string> = {
   'Content-Type': 'application/json',
 };
 
-// Rate limit: 30 posts/comments per hour, 120 votes per hour
-const COMMENT_DELAY_MS = 8000; // ~7.5 per minute = safe
-const VOTE_DELAY_MS = 2000;
+// Rate limits from Colosseum:
+//   Forum posts/comments/edits/deletes: 30/hour per agent
+//   Forum votes: 120/hour per agent
+//   Project voting: 60/hour per agent
+const WRITE_DELAY_MS = 150_000; // 2.5 min between writes → 24/hr (safe under 30)
+const VOTE_DELAY_MS = 3_500;    // ~17/min → safe under 120/hr
+const PROJECT_VOTE_DELAY_MS = 5_000; // ~12/min → safe under 60/hr
+
+let writesThisHour = 0;
+let hourStart = Date.now();
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function api(path: string, opts?: RequestInit) {
+function checkWriteBudget(): boolean {
+  if (Date.now() - hourStart > 3_600_000) {
+    writesThisHour = 0;
+    hourStart = Date.now();
+  }
+  return writesThisHour < 28; // leave 2 buffer
+}
+
+function recordWrite() {
+  writesThisHour++;
+  console.log(`     [rate] ${writesThisHour}/28 writes used this window`);
+}
+
+async function api(path: string, opts?: RequestInit): Promise<any> {
   const res = await fetch(`${API_BASE}${path}`, { headers, ...opts });
+
+  if (res.status === 429) {
+    const retryAfter = parseInt(res.headers.get('retry-after') || '120', 10);
+    const waitMs = Math.max(retryAfter * 1000, 120_000);
+    console.warn(`  ⏳ Rate limited (429). Waiting ${Math.round(waitMs / 1000)}s...`);
+    await sleep(waitMs);
+    // Retry once
+    const retry = await fetch(`${API_BASE}${path}`, { headers, ...opts });
+    if (!retry.ok) {
+      console.warn(`  ❌ Still rate limited after retry`);
+      return null;
+    }
+    return retry.json();
+  }
+
   if (!res.ok) {
     const text = await res.text();
     console.warn(`  API ${res.status}: ${text.slice(0, 200)}`);
@@ -327,17 +362,19 @@ async function run() {
   if (!skipPosts && !onlyReplies) {
     console.log('📝 Phase 1: Posting new threads...\n');
     for (const post of NEW_POSTS) {
+      if (!checkWriteBudget()) { console.log('  ⛔ Write budget exhausted, waiting...'); await sleep(WRITE_DELAY_MS); continue; }
       try {
         const result = await api('/forum/posts', {
           method: 'POST',
           body: JSON.stringify(post),
         });
         if (result?.post) {
+          recordWrite();
           console.log(`  ✅ Posted: "${post.title.slice(0, 60)}..." (ID: ${result.post.id})`);
         } else {
           console.log(`  ⚠️ Skipped (may already exist): "${post.title.slice(0, 60)}..."`);
         }
-        await sleep(COMMENT_DELAY_MS);
+        await sleep(WRITE_DELAY_MS);
       } catch (err: any) {
         console.log(`  ❌ Error: ${err.message}`);
       }
@@ -379,6 +416,7 @@ async function run() {
     );
 
     for (const comment of unreplied.slice(0, 5)) {
+      if (!checkWriteBudget()) { console.log('  ⛔ Write budget exhausted, pausing...'); break; }
       const reply = await generateReplyWithAI(post, comment);
       if (!reply) continue;
 
@@ -388,10 +426,11 @@ async function run() {
           body: JSON.stringify({ body: reply }),
         });
         if (result?.comment) {
+          recordWrite();
           replyCount++;
           console.log(`  ✅ [${replyCount}] Replied to @${comment.agentName} on "${post.title.slice(0, 40)}..."`);
         }
-        await sleep(COMMENT_DELAY_MS);
+        await sleep(WRITE_DELAY_MS);
       } catch (err: any) {
         console.log(`  ❌ Reply error: ${err.message}`);
       }
@@ -442,6 +481,12 @@ async function run() {
         continue;
       }
 
+      if (!checkWriteBudget()) {
+        console.log('  ⛔ Write budget exhausted for this hour. Waiting 5 min...');
+        await sleep(300_000);
+        if (!checkWriteBudget()) { console.log('  ⛔ Still exhausted. Stopping comments.'); break; }
+      }
+
       console.log(`  🧠 Generating comment for "${post.title.slice(0, 50)}..." by ${post.agentName}`);
       const comment = await generateCommentWithAI(post);
       if (!comment) {
@@ -455,10 +500,11 @@ async function run() {
           body: JSON.stringify({ body: comment }),
         });
         if (result?.comment) {
+          recordWrite();
           commentCount++;
           console.log(`  ✅ [${commentCount}/${maxComments}] Commented on "${post.title.slice(0, 50)}..."`);
         }
-        await sleep(COMMENT_DELAY_MS);
+        await sleep(WRITE_DELAY_MS);
       } catch (err: any) {
         console.log(`  ❌ Error commenting on ${post.id}: ${err.message}`);
       }
@@ -502,7 +548,7 @@ async function run() {
         body: JSON.stringify({ value: 1 }),
       });
       if (result && !result.error) projectVotes++;
-      await sleep(VOTE_DELAY_MS);
+      await sleep(PROJECT_VOTE_DELAY_MS);
     } catch {
       // Already voted
     }
